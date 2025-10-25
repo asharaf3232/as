@@ -2,6 +2,7 @@ import logging
 import requests
 import sqlite3
 import time
+import os
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -14,10 +15,10 @@ from telegram.ext import (
 )
 
 # --- الإعدادات (نفس السابقة) ---
-# ! املأ هذه الحقول !
-TELEGRAM_BOT_TOKEN = "YourTelegramBotToken"
-BSCSCAN_API_KEY = "YourBSCScanApiKeyHere"
-ARKHAM_API_KEY = "Your_NEW_Arkham_API_Key_Here"
+# --- الإعدادات (تقرأ من بيئة PM2) ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY")
+ARKHAM_API_KEY = os.getenv("ARKHAM_API_KEY")
 
 # 2. عناوين API
 DEXSCREENER_API_BASE = "https://api.dexscreener.com/latest/dex"
