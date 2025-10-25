@@ -1,0 +1,4 @@
+requests
+schedule
+python-telegram-bot
+python-dotenv
