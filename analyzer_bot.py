@@ -93,7 +93,7 @@ def get_token_creation_time(token_address):
 
 def get_early_buyers(token_address, created_at):
     """الحصول على المشترين الأوائل عبر BSCScan API"""
-    early_time = created_at + datetime.timedelta(minutes=EARLY_BUYER_TIMEFRAME_MINUTES)
+    early_time = created_at + timedelta(minutes=EARLY_BUYER_TIMEFRAME_MINUTES)
     end_timestamp = int(early_time.timestamp())
     
     url = (f"{BSCSCAN_API_BASE}?module=account&action=tokentx"
