@@ -3,7 +3,8 @@ import requests
 import sqlite3
 import time
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
