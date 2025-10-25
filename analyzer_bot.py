@@ -3,8 +3,7 @@ import requests
 import sqlite3
 import time
 import os
-from datetime import datetime, timedelta
-
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -15,25 +14,22 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-# --- الإعدادات (نفس السابقة) ---
-# --- الإعدادات (تقرأ من بيئة PM2) ---
+# --- الإعدادات (تقرأ من بيئة PM2 / ecosystem.config.js) ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY")
 ARKHAM_API_KEY = os.getenv("ARKHAM_API_KEY")
 
 # 2. عناوين API
-DEXSCREENER_API_BASE = "https://api.dexscreener.com/latest/dex"
 BSCSCAN_API_BASE = "https://api.bscscan.com/api"
 ARKHAM_API_BASE = "https://api.arkham.com/v1"
 
 # 3. معايير التحليل
-EARLY_BUYER_TIMEFRAME_MINUTES = 15
 MIN_PNL_USD_TO_NOTIFY = 100000  # 100k$ P&L
 
 # 4. إعدادات أخرى
-DB_NAME = 'arkham_hunter.db' # نفس ملف الـ DB السابق (سيستخدم كذاكرة)
+DB_NAME = 'arkham_hunter.db' # سيتم إنشاؤه في نفس المجلد
 
-# إعداد Logging (سيعرض في الطرفية الآن)
+# إعداد Logging (سيعرض في pm2 logs)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -55,12 +51,19 @@ CREATE TABLE IF NOT EXISTS wallets (
 conn.commit()
 
 # --- تعريف حالات المحادثة ---
-# سنستخدم هذا لإدارة "ماذا ينتظر البوت من المستخدم"
 STATE_START, STATE_AWAITING_CONTRACT = range(2)
 
 # --- الدوال المساعدة (طلبات API) ---
+
 def make_api_request(url, headers=None, retries=3):
-    """طلب API (متزامن)"""
+    """طلب API (متزامن) مع User-Agent (لتجنب الحظر)"""
+    
+    # إضافة User-Agent افتراضي
+    if headers is None:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+    
     for attempt in range(retries):
         try:
             time.sleep(0.5) # لتجنب ضغط الـ API
@@ -72,63 +75,36 @@ def make_api_request(url, headers=None, retries=3):
             time.sleep(1)
     return None
 
-# (ألصق الدالة الجديدة دي مكانها)
-def get_token_creation_time(token_address):
-    """جلب وقت إنشاء العملة (بالبحث عن أقدم pair) - نسخة محسنة"""
-
-    # 1. نستخدم /search بدلاً من /tokens/ لأنه أذكى
-    url = f"{DEXSCREENER_API_BASE}/search?q={token_address}"
-    data = make_api_request(url)
-
-    if not data or 'pairs' not in data or not data['pairs']:
-        logger.warning(f"لم يتم العثور على Pair للعملة {token_address} في DexScreener (عبر البحث)")
-        return None
-
-    try:
-        pairs = data['pairs']
-
-        # 2. نفرز الـ pairs عشان نجيب الأقدم (الأصغر في وقت الإنشاء)
-        pairs.sort(key=lambda p: p.get('pairCreatedAt', float('inf')))
-
-        # 3. الآن أول pair هو الأقدم
-        oldest_pair = pairs[0]
-        created_at_ms = oldest_pair['pairCreatedAt']
-        created_at = datetime.fromtimestamp(created_at_ms / 1000)
-
-        logger.info(f"تم العثور على أقدم Pair للعملة، وقت الإنشاء: {created_at}")
-        return created_at
-
-    except Exception as e:
-        logger.error(f"خطأ في استخراج وقت إنشاء {token_address} من بيانات البحث: {e}", exc_info=True)
-        return None
-
-
-def get_early_buyers(token_address, created_at):
-    """الحصول على المشترين الأوائل عبر BSCScan API"""
-    early_time = created_at + timedelta(minutes=EARLY_BUYER_TIMEFRAME_MINUTES)
-    end_timestamp = int(early_time.timestamp())
+def get_early_buyers(token_address):
+    """
+    الحصول على أقدم المشترين (أول 100 معاملة)
+    (نسخة جديدة لا تعتمد على DexScreener)
+    """
+    logger.info(f"جاري جلب أقدم 100 معاملة لـ {token_address[:8]}... من BSCScan")
     
     url = (f"{BSCSCAN_API_BASE}?module=account&action=tokentx"
            f"&contractaddress={token_address}"
-           f"&page=1&offset=100&sort=asc"
+           f"&page=1&offset=100&sort=asc" # <-- السحر كله هنا: أول 100 بالترتيب
            f"&apikey={BSCSCAN_API_KEY}")
     
     data = make_api_request(url)
-    if not data or data['status'] != '1':
-        logger.error(f"فشل جلب txns لـ {token_address}")
-        return set()
+    if not data or data.get('status') != '1' or not data.get('result'):
+        logger.error(f"فشل جلب txns لـ {token_address} (قد يكون المفتاح خطأ أو العقد غير مدعوم)")
+        return set() # إرجاع مجموعة فارغة
     
     early_buyers = set()
     for tx in data['result']:
         try:
-            tx_timestamp = int(tx['timeStamp'])
-            if tx_timestamp <= end_timestamp and float(tx['value']) > 0:
-                if len(tx['to']) == 42 and tx['to'].lower() != token_address.lower() and not tx['to'].lower().startswith("0x0000"):
-                    early_buyers.add(tx['to'].lower())
+            # التأكد أنها معاملة شراء (transfer to wallet) وليست بيع أو LP
+            if float(tx['value']) > 0:
+                buyer_address = tx['to'].lower()
+                # فلترة العناوين البسيطة (تجاهل العقود أو العناوين المحروقة)
+                if len(buyer_address) == 42 and not buyer_address.startswith("0x0000") and buyer_address != token_address:
+                    early_buyers.add(buyer_address)
         except Exception as e:
             logger.warning(f"خطأ في معالجة tx: {e}")
             
-    logger.info(f"تم العثور على {len(early_buyers)} early buyer للـ token {token_address[:8]}")
+    logger.info(f"تم العثور على {len(early_buyers)} مشتري فريد في أقدم 100 معاملة.")
     return early_buyers
 
 def get_arkham_intelligence(address):
@@ -180,12 +156,12 @@ def get_arkham_intelligence(address):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """إرسال رسالة ترحيب وعرض الأزرار الرئيسية"""
-    keyboard = [["🔍 تحليل عقد جديد"]]
+    keyboard = [["🔍 تحليل أقدم الحاملين"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     await update.message.reply_text(
-        "أهلاً بك في بوت المحلل الاستخباراتي.\n\n"
-        "اضغط 'تحليل عقد جديد' ثم أرسل لي عقد العملة (BSC) لأقوم بتحليل المشترين الأوائل.",
+        "أهلاً بك في بوت (محلل الأقدمين).\n\n"
+        "اضغط 'تحليل أقدم الحاملين' ثم أرسل لي (عنوان العملة) لأقوم بتحليل أقدم 100 معاملة وأجلب لك المحافظ الذكية بينهم.",
         reply_markup=reply_markup,
     )
     return STATE_START
@@ -193,38 +169,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def ask_for_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """يطلب من المستخدم إرسال العقد"""
     await update.message.reply_text(
-        "حسناً، الرجاء إرسال عنوان عقد العملة (BSC) الآن...",
+        "حسناً، الرجاء إرسال (عنوان العملة - Token Address) الآن...",
         reply_markup=ReplyKeyboardRemove(), # إخفاء الأزرار مؤقتاً
     )
     return STATE_AWAITING_CONTRACT
 
 async def analyze_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """الدالة الرئيسية: تستلم العقد وتبدأ التحليل"""
+    """الدالة الرئيسية: تستلم العقد وتبدأ التحليل (بدون DexScreener)"""
     token_address = update.message.text.strip().lower()
     
     # تحقق بسيط من أن العنوان صالح
     if not (len(token_address) == 42 and token_address.startswith("0x")):
-        await update.message.reply_text("❌ عنوان عقد غير صالح. الرجاء إرسال عنوان BSC صحيح.")
+        await update.message.reply_text("❌ عنوان عقد غير صالح. الرجاء إرسال عنوان BSC صحيح (Token Address).")
         return STATE_AWAITING_CONTRACT # اطلب منه مرة أخرى
 
-    await update.message.reply_text("⏳ تم استلام العقد. جاري التحليل، قد يستغرق هذا دقيقة...")
+    await update.message.reply_text("⏳ تم استلام العقد. جاري جلب أقدم 100 معاملة من BSCScan...")
 
     try:
-        # --- خطوة 1: جلب وقت الإنشاء ---
-        created_at = get_token_creation_time(token_address)
-        if not created_at:
-            await update.message.reply_text(f"❌ فشل العثور على العملة {token_address[:8]}... في DexScreener. تأكد أنه عقد عملة وليس Pair.")
-            return await start(update, context) # العودة للبداية
-
-        # --- خطوة 2: جلب المشترين الأوائل ---
-        early_buyers = get_early_buyers(token_address, created_at)
+        # --- خطوة 1: جلب المشترين الأوائل (مباشرة من BSCScan) ---
+        early_buyers = get_early_buyers(token_address)
         if not early_buyers:
-            await update.message.reply_text(f"✅ تم تحليل {token_address[:8]}... \nلم يتم العثور على مشترين أوائل في أول {EARLY_BUYER_TIMEFRAME_MINUTES} دقيقة.")
+            await update.message.reply_text(
+                f"✅ تم تحليل {token_address[:8]}... \n"
+                "لم يتم العثور على مشترين (إما لا توجد معاملات بعد، أو فشل في طلب BSCScan. تأكد أن المفتاح سليم وأن هذا 'عنوان عملة').",
+                parse_mode='Markdown'
+            )
             return await start(update, context) # العودة للبداية
 
-        # --- خطوة 3: تحليل المشترين بـ Arkham ---
+        # --- خطوة 2: تحليل المشترين بـ Arkham ---
         smart_wallets_found = []
-        await update.message.reply_text(f"⏳ تم العثور على {len(early_buyers)} مشتري مبكر. جاري فحصهم بـ Arkham...")
+        await update.message.reply_text(f"⏳ تم العثور على {len(early_buyers)} مشتري فريد. جاري فحصهم بـ Arkham... (قد يستغرق هذا عدة دقائق)")
 
         for buyer in early_buyers:
             intel = get_arkham_intelligence(buyer)
@@ -238,11 +212,11 @@ async def analyze_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     'is_smart': intel['is_smart']
                 })
 
-        # --- خطوة 4: إرسال التقرير النهائي ---
+        # --- خطوة 3: إرسال التقرير النهائي ---
         if not smart_wallets_found:
-            await update.message.reply_text(f"✅ تحليل كامل لـ {token_address[:8]}... \n\nتم فحص {len(early_buyers)} مشتري مبكر، ولم يتم العثور على محافظ 'Smart Money' معروفة بينهم.")
+            await update.message.reply_text(f"✅ تحليل كامل لـ {token_address[:8]}... \n\nتم فحص {len(early_buyers)} مشتري قديم، ولم يتم العثور على محافظ 'Smart Money' معروفة بينهم.")
         else:
-            report = f"🎯 **تقرير استخباراتي لـ {token_address[:8]}...** 🎯\n\nتم العثور على {len(smart_wallets_found)} محفظة مميزة من أصل {len(early_buyers)} مشتري مبكر:\n\n"
+            report = f"🎯 **تقرير استخباراتي لـ {token_address[:8]}...** 🎯\n\nتم العثور على {len(smart_wallets_found)} محفظة مميزة من أصل {len(early_buyers)} مشتري قديم:\n\n"
             report += "--------------------\n"
             
             smart_wallets_found.sort(key=lambda x: x['pnl'], reverse=True) # ترتيب حسب الربح
@@ -265,7 +239,7 @@ async def analyze_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     except Exception as e:
         logger.error(f"حدث خطأ فادح أثناء التحليل: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ حدث خطأ أثناء التحليل. الرجاء مراجعة اللوج.")
+        await update.message.reply_text(f"❌ حدث خطأ أثناء التحليل. الرجاء مراجعة اللوج (`pm2 logs ArkhamAnalyzer`).")
 
     # العودة إلى القائمة الرئيسية
     return await start(update, context)
@@ -274,12 +248,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """إلغاء الأمر والعودة للبداية"""
     await update.message.reply_text(
         "تم الإلغاء. العودة للقائمة الرئيسية.",
-        reply_markup=ReplyKeyboardMarkup([["🔍 تحليل عقد جديد"]], resize_keyboard=True),
+        reply_markup=ReplyKeyboardMarkup([["🔍 تحليل أقدم الحاملين"]], resize_keyboard=True),
     )
     return STATE_START
 
 def main() -> None:
     """الدالة الرئيسية لتشغيل البوت"""
+    # التأكد من وجود المفاتيح قبل التشغيل
+    if not TELEGRAM_BOT_TOKEN or not BSCSCAN_API_KEY or not ARKHAM_API_KEY:
+        logger.error("خطأ فادح: واحد أو أكثر من مفاتيح API (TELEGRAM_BOT_TOKEN, BSCSCAN_API_KEY, ARKHAM_API_KEY) غير موجود. تأكد من ملف ecosystem.config.js")
+        return
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # إعداد نظام المحادثة لإدارة الحالات
@@ -287,7 +266,7 @@ def main() -> None:
         entry_points=[CommandHandler("start", start)],
         states={
             STATE_START: [
-                MessageHandler(filters.Regex("^🔍 تحليل عقد جديد$"), ask_for_contract)
+                MessageHandler(filters.Regex("^🔍 تحليل أقدم الحاملين$"), ask_for_contract)
             ],
             STATE_AWAITING_CONTRACT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_contract)
@@ -298,7 +277,7 @@ def main() -> None:
 
     application.add_handler(conv_handler)
     
-    logger.info("--- 🚀 بوت المحلل الاستخباراتي بدأ التشغيل 🚀 ---")
+    logger.info("--- 🚀 بوت (محلل الأقدمين) بدأ التشغيل 🚀 ---")
     logger.info("--- أرسل /start للبوت لبدء الواجهة ---")
     
     # بدء تشغيل البوت (سيظل يعمل 24/7)
