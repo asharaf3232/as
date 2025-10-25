@@ -72,24 +72,36 @@ def make_api_request(url, headers=None, retries=3):
             time.sleep(1)
     return None
 
+# (ألصق الدالة الجديدة دي مكانها)
 def get_token_creation_time(token_address):
-    """جلب وقت إنشاء العملة من DexScreener"""
-    url = f"{DEXSCREENER_API_BASE}/tokens/{token_address}"
+    """جلب وقت إنشاء العملة (بالبحث عن أقدم pair) - نسخة محسنة"""
+
+    # 1. نستخدم /search بدلاً من /tokens/ لأنه أذكى
+    url = f"{DEXSCREENER_API_BASE}/search?q={token_address}"
     data = make_api_request(url)
-    
+
     if not data or 'pairs' not in data or not data['pairs']:
-        logger.warning(f"لم يتم العثور على Pair للعملة {token_address} في DexScreener")
+        logger.warning(f"لم يتم العثور على Pair للعملة {token_address} في DexScreener (عبر البحث)")
         return None
-    
-    # نفترض أن أول pair هو الأقدم (الأهم)
+
     try:
-        # pairCreatedAt يأتي كـ timestamp بالمللي ثانية
-        created_at_ms = data['pairs'][0]['pairCreatedAt']
+        pairs = data['pairs']
+
+        # 2. نفرز الـ pairs عشان نجيب الأقدم (الأصغر في وقت الإنشاء)
+        pairs.sort(key=lambda p: p.get('pairCreatedAt', float('inf')))
+
+        # 3. الآن أول pair هو الأقدم
+        oldest_pair = pairs[0]
+        created_at_ms = oldest_pair['pairCreatedAt']
         created_at = datetime.fromtimestamp(created_at_ms / 1000)
+
+        logger.info(f"تم العثور على أقدم Pair للعملة، وقت الإنشاء: {created_at}")
         return created_at
+
     except Exception as e:
-        logger.error(f"خطأ في استخراج وقت إنشاء {token_address}: {e}")
+        logger.error(f"خطأ في استخراج وقت إنشاء {token_address} من بيانات البحث: {e}", exc_info=True)
         return None
+
 
 def get_early_buyers(token_address, created_at):
     """الحصول على المشترين الأوائل عبر BSCScan API"""
